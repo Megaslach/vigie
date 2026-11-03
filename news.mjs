@@ -2,7 +2,7 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
-import https from 'node:https';
+import { BlockList, isIP } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { categories } from './sources.mjs';
@@ -17,10 +17,6 @@ const IMAGE_LOOKUPS_PER_CATEGORY = 60;
 const REDDIT_PER_RUN = 3;
 const HOST_DELAY = { 'www.reddit.com': 65000 };
 const wait = ms => new Promise(r => setTimeout(r, ms));
-const TRANSLATE_URL = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=fr&dt=t&q=';
-const TRANSLATE_CHARS = 1800; // taille d'un lot : le texte passe dans l'URL
-const TRANSLATE_BATCHES = 40; // lots par passage
-const TRANSLATE_PAUSE = 400;
 
 const NAMED = {
   amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', hellip: '…', rsquo: '’', lsquo: '‘', ldquo: '“', rdquo: '”',
@@ -152,9 +148,10 @@ async function pool(list, size, fn) {
   }));
 }
 
-const PRIVATE_V4 = '(0\\.|10\\.|127\\.|169\\.254\\.|192\\.168\\.|172\\.(1[6-9]|2\\d|3[01])\\.|100\\.(6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])\\.)';
-const PRIVATE_IP = new RegExp(`^(${PRIVATE_V4}|::1?$|f[cd]|fe[89ab]|::ffff:${PRIVATE_V4})`, 'i');
-export const isPrivateIp = ip => PRIVATE_IP.test(ip);
+const NON_PUBLIC = new BlockList(); // couvre aussi les adresses IPv4 mappées en IPv6, quelle que soit leur écriture
+for (const [net, bits] of [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['224.0.0.0', 4], ['240.0.0.0', 4]]) NON_PUBLIC.addSubnet(net, bits, 'ipv4');
+for (const [net, bits] of [['::', 128], ['::1', 128], ['64:ff9b::', 96], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8]]) NON_PUBLIC.addSubnet(net, bits, 'ipv6');
+export const isPrivateIp = ip => !isIP(ip) || NON_PUBLIC.check(ip, isIP(ip) === 6 ? 'ipv6' : 'ipv4');
 
 // Les liens viennent de flux non fiables : ni réseau interne, ni redirection vers lui.
 // shortcut: l'adresse vérifiée peut changer avant la connexion (DNS rebinding), à figer avec un Agent undici si Vigie lit un jour des flux inconnus.
@@ -190,78 +187,6 @@ async function findOgImage(url) {
     }
   }
   return null;
-}
-
-export const looksFrench = s => /[éèêàçùœ]|\b(le|la|les|des|une|pour|avec|dans|sur|est|et|du|au)\b/i.test(s);
-
-// Réponse de Google : segments [traduction, original, ...], une ligne par titre. Lignes décalées = RangeError.
-export function parseTranslation(body, count) {
-  const segments = Array.isArray(body?.[0]) ? body[0] : [];
-  const lines = segments.map(s => s?.[0] ?? '').join('').split('\n').map(l => l.trim());
-  if (lines.length !== count || !lines.every(l => l && l.length < 400)) throw new RangeError('réponse de traduction invalide');
-  return lines;
-}
-
-// Ce service répond HTTP 429 à fetch mais accepte le module https (mesuré).
-const getJson = url => new Promise((resolve, reject) => {
-  const req = https.get(url, { timeout: 15000 }, res => {
-    if (res.statusCode !== 200) {
-      res.resume();
-      reject(new Error(`HTTP ${res.statusCode}`));
-      return;
-    }
-    let body = '';
-    res.setEncoding('utf8');
-    res.on('data', chunk => { body += chunk; });
-    res.on('end', () => {
-      try { resolve(JSON.parse(body)); } catch (err) { reject(err); }
-    });
-  });
-  req.on('timeout', () => req.destroy(new Error('pas de réponse')));
-  req.on('error', reject);
-});
-
-export async function translateBatch(titles) {
-  return parseTranslation(await getJson(TRANSLATE_URL + encodeURIComponent(titles.join('\n'))), titles.length);
-}
-
-async function translateInto(batch) {
-  let out;
-  try {
-    out = await translateBatch(batch.map(it => it.title));
-  } catch (err) {
-    if (!(err instanceof RangeError)) throw err; // panne ou quota : réessai au prochain passage
-    if (batch.length === 1) batch[0].titleFr = batch[0].title; // intraduisible : on garde l'original, sans bloquer les suivants
-    else for (const it of batch) await translateInto([it]);
-    return;
-  }
-  batch.forEach((it, i) => { it.titleFr = out[i]; });
-}
-
-// Service gratuit et non officiel de Google, sans clé : s'il coupe, les titres restent en version originale.
-async function translateTitles() {
-  const queue = Object.values(store.items).filter(it => !it.titleFr && !looksFrench(it.title)).sort((a, b) => b.ts - a.ts);
-  const batches = [];
-  let size = Infinity;
-  for (const it of queue) {
-    const length = encodeURIComponent(it.title).length + 3;
-    if (size + length > TRANSLATE_CHARS) {
-      batches.push([]);
-      size = 0;
-    }
-    batches.at(-1).push(it);
-    size += length;
-  }
-  try {
-    for (const batch of batches.slice(0, TRANSLATE_BATCHES)) {
-      await translateInto(batch);
-      await wait(TRANSLATE_PAUSE);
-    }
-    store.translation = { ok: true, pending: batches.slice(TRANSLATE_BATCHES).flat().length };
-  } catch (err) {
-    console.error('Traduction échouée :', err.message);
-    store.translation = { ok: false, error: err.message };
-  }
 }
 
 const STOP = new Set('les des une pour sur avec dans par que qui est sont aux ses son leur the and for with from that this are was has have will new its his her you your how why what plus nouveau nouvelle'.split(' '));
@@ -340,7 +265,6 @@ export async function refresh() {
           store.items[id] = {
             ...old, ...it, id, ts,
             img: it.img ?? old?.img ?? null,
-            titleFr: old?.title === it.title ? old?.titleFr : undefined,
             cat: src.cat, source: src.name, kind: src.kind ?? 'article', weight: src.weight ?? 1, noLead: src.noLead,
           };
         }
@@ -367,8 +291,6 @@ export async function refresh() {
     it.img = await findOgImage(it.url).catch(() => null);
   });
 
-  await translateTitles();
-
   store.generatedAt = Date.now();
   await save();
   return snapshot();
@@ -376,15 +298,13 @@ export async function refresh() {
 
 export function snapshot() {
   const now = Date.now();
-  const all = Object.values(store.items).map(({ titleFr, ...it }) => (
-    { ...it, title: titleFr ?? it.title, original: titleFr && titleFr !== it.title ? it.title : null }
-  ));
+  const all = Object.values(store.items);
   const items = categories.flatMap(cat => {
     const mine = cluster(all.filter(it => it.cat === cat.id)).map(it => ({ ...it, score: scoreOf(it, now) }));
     mine.sort((a, b) => b.score - a.score);
     // Sujets lus dans le titre seul : les résumés citent trop de choses pour filtrer juste.
     return mine.slice(0, PER_CATEGORY).map(({ weight, imgTried, ...it }) => (
-      { ...it, topics: Object.entries(cat.topics).filter(([, re]) => re.test(`${it.title} ${it.original ?? ''}`)).map(([name]) => name) }
+      { ...it, topics: Object.entries(cat.topics).filter(([, re]) => re.test(it.title)).map(([name]) => name) }
     ));
   });
   return {
@@ -392,7 +312,6 @@ export function snapshot() {
     categories: categories.map(({ id, name, short, color, icon, topics, sources }) => ({ id, name, short, color, icon, topics: Object.keys(topics), sourceCount: sources.length })),
     items,
     health: Object.values(store.health),
-    translation: store.translation ?? null,
   };
 }
 
@@ -417,5 +336,4 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     console.log(`  ${cat.short.padEnd(12)} ${String(mine.length).padStart(4)} articles, ${String(day).padStart(4)} en 24 h, ${Math.round(100 * mine.filter(i => i.img).length / (mine.length || 1))} % avec image`);
   }
   for (const h of bad) console.log(`  KO ${h.cat}/${h.name} : ${h.error}`);
-  console.log(`  Traduction : ${JSON.stringify(snap.translation)}, ${snap.items.filter(i => i.original).length} titres traduits`);
 }

@@ -65,6 +65,74 @@ const fold = s => s.toLowerCase().normalize('NFD').replace(/\p{M}/gu, '');
 const plural = (n, one, many) => `${n} ${n > 1 ? many : one}`;
 const setWall = color => $('wall').style.setProperty('--wall', color);
 
+// Traduction : ce service gratuit et non officiel de Google refuse les serveurs de GitHub. C'est donc le navigateur
+// qui traduit, puis qui retient les titres. S'il coupe, les titres restent en version originale.
+const TRANSLATE_URL = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=fr&dt=t&q=';
+const TRANSLATE_CHARS = 1800; // le texte passe dans l'URL
+const fr = store.read('vigie.fr', {}); // article -> titre français
+let translating = false;
+let translateError = false;
+const looksFrench = s => /[éèêàçùœ]|\b(le|la|les|des|une|pour|avec|dans|sur|est|et|du|au)\b/i.test(s);
+
+function adopt(snapshot) {
+  for (const item of snapshot.items) {
+    if (fr[item.id] && fr[item.id] !== item.title) {
+      item.original = item.title;
+      item.title = fr[item.id];
+    }
+  }
+  return snapshot;
+}
+
+function setFrench(item, text) {
+  fr[item.id] = text;
+  if (text === item.title) return;
+  item.original = item.title;
+  item.title = text;
+  for (const node of document.querySelectorAll(`[data-title="${item.id}"]`)) {
+    node.textContent = text;
+    node.title = item.original;
+    node.closest('.tab')?.setAttribute('aria-label', text);
+    if (!matchMedia('(prefers-reduced-motion: reduce)').matches) node.animate([{ opacity: .2 }, { opacity: 1 }], { duration: 600, easing: 'ease' });
+  }
+  for (const node of document.querySelectorAll(`[data-summary="${item.id}"]`)) node.remove();
+}
+
+async function translateBatch(batch) {
+  const res = await fetch(TRANSLATE_URL + encodeURIComponent(batch.map(i => i.title).join('\n')), { referrerPolicy: 'no-referrer' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const [segments] = await res.json();
+  const lines = (segments ?? []).map(s => s?.[0] ?? '').join('').split('\n').map(l => l.trim());
+  if (lines.length === batch.length && lines.every(Boolean)) batch.forEach((item, i) => setFrench(item, lines[i]));
+  else if (batch.length === 1) setFrench(batch[0], batch[0].title); // intraduisible : on garde l'original, sans bloquer les suivants
+  else for (const item of batch) await translateBatch([item]); // lignes décalées : un titre à la fois
+}
+
+async function translateAll() {
+  if (translating || !data) return;
+  translating = true;
+  const ids = new Set(data.items.map(i => i.id));
+  for (const id of Object.keys(fr)) if (!ids.has(id)) delete fr[id];
+  const queue = data.items.filter(i => !fr[i.id] && !looksFrench(i.title)).sort((a, b) => b.score - a.score);
+  try {
+    while (queue.length) {
+      const batch = [];
+      let size = 0;
+      while (queue.length && (!batch.length || size + encodeURIComponent(queue[0].title).length + 3 <= TRANSLATE_CHARS)) {
+        size += encodeURIComponent(queue[0].title).length + 3;
+        batch.push(queue.shift());
+      }
+      await translateBatch(batch);
+      store.write('vigie.fr', fr);
+      await new Promise(r => setTimeout(r, 300));
+    }
+    translateError = false;
+  } catch {
+    translateError = true;
+  }
+  translating = false;
+}
+
 function timeLabel(ts) {
   const diff = Date.now() - ts;
   if (diff < 60e3) return 'à l’instant';
@@ -102,7 +170,7 @@ const summaryOf = item => (item.original ? '' : item.summary);
 function media(item) {
   const cat = catOf(item.cat);
   const fallback = () => (summaryOf(item)
-    ? el('div', { class: 'excerpt' }, summaryOf(item))
+    ? el('div', { class: 'excerpt', 'data-summary': item.id }, summaryOf(item))
     : el('div', { class: 'glyph' }, icon(cat.icon)));
   const box = el('div', { class: `media${item.img ? '' : ' bare'}` });
   if (item.img) {
@@ -124,7 +192,7 @@ function card(item) {
       deal && (item.price || item.merchant) && el('div', { class: 'price-row' },
         item.price && el('span', { class: 'price' }, item.price),
         item.merchant && el('span', { class: 'merchant' }, item.merchant)),
-      el('h3', { title: item.original }, item.title),
+      el('h3', { title: item.original, 'data-title': item.id }, item.title),
       meta(item)));
 }
 
@@ -136,8 +204,8 @@ function hero(stories, head, { showCat = false } = {}) {
     class: `copy${i ? '' : ' on'}`, href: s.url, target: '_blank', rel: 'noopener noreferrer', tabindex: i ? '-1' : null, 'aria-hidden': i ? 'true' : null,
   },
   showCat && el('div', { class: 'kicker' }, tile(catOf(s.cat)), catOf(s.cat).name),
-  el('h2', { title: s.original }, s.title),
-  summaryOf(s) && el('p', { class: 'deck' }, summaryOf(s)),
+  el('h2', { title: s.original, 'data-title': s.id }, s.title),
+  summaryOf(s) && el('p', { class: 'deck', 'data-summary': s.id }, summaryOf(s)),
   meta(s)));
   const show = i => {
     current = i;
@@ -151,7 +219,7 @@ function hero(stories, head, { showCat = false } = {}) {
   };
   const tabs = stories.map((s, i) => el('button', { class: `tab${i ? '' : ' on'}`, type: 'button', 'aria-label': s.title, 'aria-pressed': String(!i), onclick: () => show(i) },
     el('span', { class: 'bar' }, el('i', {})),
-    el('span', { class: 'tab-title' }, s.title)));
+    el('span', { class: 'tab-title', 'data-title': s.id }, s.title)));
   const bar = stories.length > 1 && el('div', { class: 'tabs glass', role: 'group', 'aria-label': 'Articles à la une', onanimationend: () => show((current + 1) % stories.length) }, tabs);
   return el('section', { class: 'hero', 'aria-label': 'À la une', style: `--c:${catOf(stories[0].cat).color}` },
     el('div', { class: 'frames' }, frames),
@@ -375,10 +443,11 @@ function route() {
 }
 
 function applyPending() {
-  if (pending) { data = pending; pending = null; }
+  if (pending) { data = adopt(pending); pending = null; }
   $('fresh').hidden = true;
   transition(render);
   scrollTo({ top: 0, behavior: 'smooth' });
+  translateAll();
 }
 
 async function fetchNews() {
@@ -395,7 +464,7 @@ async function poll() {
     refreshing = !!status.refreshing;
     local = !!status.local;
     if (data && status.generatedAt > (pending ?? data).generatedAt) {
-      const next = await fetchNews();
+      const next = adopt(await fetchNews());
       const known = new Set(data.items.map(i => i.id));
       const added = next.items.filter(i => !known.has(i.id)).length;
       // Page encore vide : on remplit. Rien de nouveau : on ne touche pas à ce que tu lis.
@@ -443,7 +512,7 @@ function openSources() {
     el('header', {},
       el('div', {}, el('h2', {}, 'Sources'),
         el('p', {}, `${okCount} sur ${data.health.length} ont répondu à la dernière mise à jour, ${agoSentence(data.generatedAt)}. Vigie se met à jour toute seule, à peu près tous les quarts d’heure.`),
-        data.translation?.ok === false && el('p', {}, 'Traduction indisponible pour l’instant : les nouveaux titres restent en version originale.')),
+        translateError && el('p', {}, 'Traduction indisponible pour l’instant : les nouveaux titres restent en version originale.')),
       local && el('button', { class: 'act primary', type: 'button', disabled: refreshing, onclick: async e => { e.target.disabled = true; e.target.textContent = 'En cours'; await requestRefresh(); } }, refreshing ? 'En cours' : 'Mettre à jour'),
       el('button', { class: 'act', type: 'button', onclick: () => sheet.close() }, 'Fermer')),
     el('div', { class: 'body' },
@@ -551,7 +620,7 @@ document.addEventListener('visibilitychange', () => {
   poll();
   if (data && Date.now() - data.generatedAt > 10 * 60 * 1000) requestRefresh();
 });
-setInterval(() => { if (!document.hidden) { poll(); if (data) renderStatus(); } }, POLL_EVERY);
+setInterval(() => { if (!document.hidden) { poll(); translateAll(); if (data) renderStatus(); } }, POLL_EVERY);
 
 (async () => {
   view = location.hash.slice(1) || 'today';
@@ -560,8 +629,9 @@ setInterval(() => { if (!document.hidden) { poll(); if (data) renderStatus(); } 
     el('div', { class: 'skeleton hero-skel' }),
     el('div', { class: 'skeleton row-skel' }));
   try {
-    data = await fetchNews();
+    data = adopt(await fetchNews());
     render();
+    translateAll();
     await poll();
     if (Date.now() - data.generatedAt > 10 * 60 * 1000) requestRefresh();
   } catch {

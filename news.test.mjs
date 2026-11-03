@@ -1,29 +1,15 @@
 // node --test
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cleanUrl, cluster, isPrivateIp, looksFrench, parseFeed, parseTranslation } from './news.mjs';
+import { cleanUrl, cluster, isPrivateIp, parseFeed } from './news.mjs';
 
 test('adresses internes refusées, adresses publiques acceptées', () => {
-  for (const ip of ['127.0.0.1', '10.1.2.3', '192.168.1.1', '172.16.0.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '::1', '::', 'fc00::1', 'fe80::1', '::ffff:127.0.0.1', '::ffff:169.254.169.254']) {
+  for (const ip of ['127.0.0.1', '10.1.2.3', '192.168.1.1', '172.16.0.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '::1', '::', 'fc00::1', 'fe80::1', '::ffff:127.0.0.1', '::ffff:169.254.169.254', '::ffff:7f00:1', '0:0:0:0:0:ffff:a00:1', '224.0.0.1', 'ff02::1', '64:ff9b::7f00:1', 'pas une adresse']) {
     assert.equal(isPrivateIp(ip), true, ip);
   }
   for (const ip of ['8.8.8.8', '172.32.0.1', '100.128.0.1', '11.0.0.1', '2606:4700::1111', '::ffff:8.8.8.8']) {
     assert.equal(isPrivateIp(ip), false, ip);
   }
-});
-
-test('traduction : une ligne par titre, sinon refus', () => {
-  const answer = [[['Un\n', 'One\n'], ['Deux ', 'Two']], null, 'en'];
-  assert.deepEqual(parseTranslation(answer, 2), ['Un', 'Deux']);
-  assert.throws(() => parseTranslation(answer, 3), RangeError);
-  assert.throws(() => parseTranslation({}, 1), RangeError);
-  assert.throws(() => parseTranslation([[['', 'x']]], 1), RangeError);
-});
-
-test('détection du français sur les titres', () => {
-  assert.equal(looksFrench('La RTX 5070 baisse encore'), true);
-  assert.equal(looksFrench('Résultats décevants'), true);
-  assert.equal(looksFrench('NVIDIA RTX 5070 price drops again'), false);
 });
 
 test('RSS : CDATA, entités, image dans le HTML, marchand Dealabs', () => {
