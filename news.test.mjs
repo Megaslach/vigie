@@ -1,15 +1,23 @@
 // node --test
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cleanUrl, cluster, looksFrench, parseFeed, parseTranslation } from './news.mjs';
+import { cleanUrl, cluster, isPrivateIp, looksFrench, parseFeed, parseTranslation } from './news.mjs';
 
-test('traduction : forme exacte exigée, sinon refus', () => {
-  assert.deepEqual(parseTranslation('["Un", " Deux "]', 2), ['Un', 'Deux']);
-  assert.deepEqual(parseTranslation('```json\n["Un"]\n```', 1), ['Un']);
-  assert.throws(() => parseTranslation('["Un"]', 2));
-  assert.throws(() => parseTranslation('{"a":1}', 1));
-  assert.throws(() => parseTranslation('Voici la traduction', 1));
-  assert.throws(() => parseTranslation('[""]', 1));
+test('adresses internes refusées, adresses publiques acceptées', () => {
+  for (const ip of ['127.0.0.1', '10.1.2.3', '192.168.1.1', '172.16.0.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '::1', '::', 'fc00::1', 'fe80::1', '::ffff:127.0.0.1', '::ffff:169.254.169.254']) {
+    assert.equal(isPrivateIp(ip), true, ip);
+  }
+  for (const ip of ['8.8.8.8', '172.32.0.1', '100.128.0.1', '11.0.0.1', '2606:4700::1111', '::ffff:8.8.8.8']) {
+    assert.equal(isPrivateIp(ip), false, ip);
+  }
+});
+
+test('traduction : une ligne par titre, sinon refus', () => {
+  const answer = [[['Un\n', 'One\n'], ['Deux ', 'Two']], null, 'en'];
+  assert.deepEqual(parseTranslation(answer, 2), ['Un', 'Deux']);
+  assert.throws(() => parseTranslation(answer, 3), RangeError);
+  assert.throws(() => parseTranslation({}, 1), RangeError);
+  assert.throws(() => parseTranslation([[['', 'x']]], 1), RangeError);
 });
 
 test('détection du français sur les titres', () => {
