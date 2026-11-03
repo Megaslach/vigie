@@ -2,8 +2,13 @@ name: Mise à jour de Vigie
 
 on:
   schedule:
-    - cron: '7,22,37,52 * * * *' # GitHub peut retarder ces passages quand ses serveurs sont chargés
+    - cron: '7 * * * *' # Secours : GitHub ne déclenche pas ces passages de façon fiable, le relais fait le rythme
   workflow_dispatch:
+    inputs:
+      attendre:
+        description: Attendre l'intervalle avant la mise à jour
+        type: boolean
+        default: false
   push:
     branches: [main]
 
@@ -12,14 +17,24 @@ permissions:
   pages: write
   id-token: write
 
-concurrency:
-  group: vigie
-  cancel-in-progress: false
-
 jobs:
+  # Le délai vient de l'environnement « intervalle » (12 min), réglé sur le dépôt : il n'est pas facturé.
+  attente:
+    if: ${{ inputs.attendre }}
+    runs-on: ubuntu-latest
+    environment: intervalle
+    permissions: {}
+    steps:
+      - run: 'true'
+
   update:
+    needs: attente
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    concurrency:
+      group: vigie
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
@@ -50,3 +65,25 @@ jobs:
             git commit --allow-empty -m 'Maintien de la planification'
             git push
           fi
+
+  # Chaque passage lance le suivant, sauf si un passage attend déjà. Pour tout arrêter : désactiver ce workflow.
+  relais:
+    needs: update
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency: vigie-relais
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          en_attente=$(gh run list -w vigie.yml -L 20 --json status -q '[.[] | select(.status | test("queued|waiting|pending|requested"))] | length' || echo 0)
+          if [ "$en_attente" -gt 0 ]; then exit 0; fi
+          for essai in 1 2 3; do
+            gh workflow run vigie.yml --ref main -f attendre=true && exit 0
+            sleep 60
+          done
+          exit 1
