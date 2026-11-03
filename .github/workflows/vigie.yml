@@ -1,0 +1,55 @@
+name: Mise à jour de Vigie
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *' # GitHub peut retarder ces passages quand ses serveurs sont chargés
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  models: read
+
+concurrency:
+  group: vigie
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test
+      # Garde les articles entre deux passages, sans commit à chaque mise à jour.
+      - uses: actions/cache@v4
+        with:
+          path: data
+          key: vigie-${{ github.run_id }}
+          restore-keys: vigie-
+      - run: node news.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+      - id: deploy
+        uses: actions/deploy-pages@v4
+      # GitHub coupe les tâches planifiées après 60 jours sans activité.
+      - name: Garder la planification active
+        run: |
+          if [ $(( $(date +%s) - $(git log -1 --format=%ct) )) -gt 2592000 ]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git commit --allow-empty -m 'Maintien de la planification'
+            git push
+          fi

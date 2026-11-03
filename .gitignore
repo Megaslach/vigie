@@ -1,0 +1,5 @@
+data/
+public/news.json
+public/status.json
+.claude/
+*.stackdump
